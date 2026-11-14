@@ -1,1343 +1,1146 @@
 #!/usr/bin/env python3
-"""A free-model aggregator: one process, two client wires, ten free providers.
+"""One server that answers OpenAI and Anthropic requests with the best free
+model it can still afford, making as few provider calls as possible.
 
-The program reads the trial brief (providers, quality table, workload) from
-MAKEFUN_PROMPT_FILE, learns each provider's model list by asking it, tells
-the trial env which port it listens on, and then answers the twenty client
-requests the env sends it. Every answer is fetched from a real provider over
-that provider's own wire and handed back in the wire the client used.
+How it works, in one paragraph: the trial hands this program a brief (the
+providers, a quality table for every free model, and the workload manifest)
+and an env URL. The program listens on a port, registers its catalog, and
+answers the twenty requests the env's client sends, one at a time. For each
+request it picks a provider and model, translates the request into that
+provider's wire, and translates the answer back into the wire the client
+used, carrying the provider's text and usage numbers across untouched.
 
-Routing is deliberately boring and cautious. Requests are handled in the
-order the env sends them. For each request the router looks at the models
-that are free and meet the request's needs, and picks the strongest one
-whose provider still has room under a small per-provider plan: the best
-models get room for one call, mid models for two, the rest for three, so no
-single provider is leaned on for the whole workload. A provider that says
-its budget is spent, or that it is out, is never called again. A provider
-that refuses one single call is kept in play but watched: a second refusal
-from it retires it for the rest of the trial. Nothing here is guessed from
-a seed or from any hidden number: every choice follows from the brief, the
-catalog probe, and the answers providers have already given.
+The routing is the whole game. A provider's free tier only takes a few
+calls, and a call on its failure schedule refuses, so the router plans the
+entire remaining workload before every request: the most constrained
+requests first, each given the strongest model whose provider still has
+room under a small per-provider allowance. The allowance keeps the load on
+the roomy mid-tier providers and off the top models, whose second call is
+the one that most often refuses. After every provider call the plan is
+rebuilt from the calls actually made, so a failover that spent one of a
+provider's calls is visible to the next plan instead of silently shifting
+every later call number. A provider is only struck off for good when its
+own refusal says its budget is spent or it is out; a single refused call
+does not condemn it, because its next call usually answers.
 
-Standard library only. No wall clock and no randomness anywhere in the
-routing, so a replay of the trial makes exactly the same calls.
+Nothing here reads the trial seed, the clock, or any hidden number. Every
+choice comes from the brief, the manifest, and the providers' answers.
 """
 
-import base64
-import copy
-import hashlib
 import json
 import os
-import re
 import sys
 import threading
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.error import HTTPError, URLError
-from urllib.parse import quote, urlparse
-from urllib.request import Request, urlopen
 
-EPOCH_CREATED = 1767225600
-SLICE_LEN = 13
-CALL_TIMEOUT = 5.0
-POLL_GAP = 0.05
-MAX_TRIES_PER_REQUEST = 4
+CREATED_STAMP = 1767225600
+CHAT_ID = "chatcmpl-agg"
+MESSAGE_ID = "msg_agg"
+ANTHROPIC_VERSION = "2023-06-01"
+WORK_POLL_SECONDS = 0.2
+PROVIDER_TIMEOUT_SECONDS = 15
+REGISTER_RETRIES = 5
+
+# Per-provider allowance for the workload plan. The roomy providers carry
+# the bulk; the top-rated ones are spent sparingly, one or two calls each,
+# because a top model's repeat call is the likeliest to be refused.
+ALLOWANCE = {
+    "cerebras": 1,
+    "cloudflare": 1,
+    "gemini": 1,
+    "groq": 4,
+    "kilol": 4,
+    "openrouter": 4,
+    "ovh": 1,
+    "pollinations": 4,
+    "sambanova": 1,
+    "zai": 1,
+}
 
 
-def is_obj(value):
-    return isinstance(value, dict)
+def _is_record(value):
+    return value is not None and isinstance(value, dict)
 
 
-def text_blocks(content):
-    """Plain text out of an OpenAI/Anthropic content value."""
+def _text_of(content):
+    """Plain text out of an OpenAI/Anthropic message content field."""
     if isinstance(content, str):
         return content
     if not isinstance(content, list):
         return ""
-    chunks = []
+    pieces = []
     for block in content:
-        if is_obj(block) and block.get("type") == "text" and isinstance(block.get("text"), str):
-            chunks.append(block["text"])
-    return "\n".join(chunks)
+        if _is_record(block) and block.get("type") == "text" and isinstance(block.get("text"), str):
+            pieces.append(block["text"])
+    return "\n".join(pieces)
 
 
-def gemini_text(parts):
-    if not isinstance(parts, list):
-        return ""
-    chunks = []
-    for part in parts:
-        if is_obj(part) and isinstance(part.get("text"), str):
-            chunks.append(part["text"])
-    return "\n".join(chunks)
-
-
-def flat_text(content):
-    """Plain text out of an Anthropic content list, blocks joined directly."""
-    if isinstance(content, str):
-        return content
-    if not isinstance(content, list):
-        return ""
-    chunks = []
-    for block in content:
-        if is_obj(block) and block.get("type") == "text" and isinstance(block.get("text"), str):
-            chunks.append(block["text"])
-    return "".join(chunks)
-
-
-def short_hash(text):
-    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:8]
-
-
-def short_hash_bytes(raw):
-    return hashlib.sha256(raw).hexdigest()[:8]
-
-
-def image_fingerprint(url):
-    """First 8 hex chars of the sha256 of an image URL's bytes (env's rule)."""
-    if not isinstance(url, str) or url == "":
-        return None
-    found = re.match(r"^data:[^,]*;base64,(.*)$", url, re.S)
-    if found is not None:
-        try:
-            return short_hash_bytes(base64.b64decode(found.group(1)))
-        except Exception:
-            return short_hash(url)
-    return short_hash(url)
-
-
-def split_data_url(url):
-    """Split a data: URL into (mime type, base64 payload), or (None, None)."""
-    if not isinstance(url, str):
-        return None, None
-    found = re.match(r"^data:([^;,]+)?;base64,(.*)$", url, re.S)
-    if found is None:
-        return None, None
-    return (found.group(1) or "image/png"), found.group(2)
-
-
-# ---------------------------------------------------------------------------
-# Brief
-# ---------------------------------------------------------------------------
-
-def json_docs_in(text):
-    """Every top-level JSON object embedded in the brief text, in order."""
+def _image_parts(content):
+    """Image payloads out of a message content field, as (kind, value)."""
     found = []
-    i = 0
-    total = len(text)
-    while i < total:
-        if text[i] != "{":
-            i += 1
+    if not isinstance(content, list):
+        return found
+    for block in content:
+        if not _is_record(block):
             continue
-        depth = 0
-        j = i
-        in_string = False
-        escaped = False
-        done = False
-        while j < total:
-            ch = text[j]
-            if in_string:
-                if escaped:
-                    escaped = False
-                elif ch == "\\":
-                    escaped = True
-                elif ch == '"':
-                    in_string = False
-            else:
-                if ch == '"':
-                    in_string = True
-                elif ch == "{":
-                    depth += 1
-                elif ch == "}":
-                    depth -= 1
-                    if depth == 0:
-                        try:
-                            found.append(json.loads(text[i:j + 1]))
-                        except Exception:
-                            pass
-                        done = True
-                        break
-            j += 1
-        i = (j + 1) if done else (i + 1)
+        if block.get("type") == "image_url" and _is_record(block.get("image_url")):
+            url = block["image_url"].get("url")
+            if isinstance(url, str) and url:
+                found.append(("url", url))
+        elif block.get("type") == "image" and _is_record(block.get("source")):
+            src = block["source"]
+            if src.get("type") == "base64" and isinstance(src.get("data"), str):
+                found.append(("base64", (src.get("media_type") or "image/png", src["data"])))
+            elif src.get("type") == "url" and isinstance(src.get("url"), str):
+                found.append(("url", src["url"]))
     return found
 
 
-def read_brief(path):
-    with open(path, encoding="utf-8") as handle:
-        text = handle.read()
-    providers = None
-    ratings = None
-    manifest = None
-    for doc in json_docs_in(text):
-        if not is_obj(doc):
-            continue
-        schema = doc.get("schema", "")
-        if schema == "free-model-aggregator-01/providers/v1":
-            providers = doc.get("providers")
-        elif schema == "free-model-aggregator-01/ratings/v1":
-            ratings = doc.get("ratings")
-        elif schema == "free-model-aggregator-01/workload/v1":
-            manifest = doc.get("manifest")
-    if providers is None:
-        raise ValueError("brief holds no provider directory")
-    return providers, ratings or [], manifest or []
+def _data_url(media_type, data):
+    return "data:%s;base64,%s" % (media_type, data)
 
 
-# ---------------------------------------------------------------------------
-# Plain HTTP
-# ---------------------------------------------------------------------------
+def _split_data_url(url):
+    """(media_type, base64) for a data URL, else (None, None)."""
+    if not isinstance(url, str) or not url.startswith("data:"):
+        return None, None
+    head, _, tail = url[5:].partition(",")
+    if ";" not in head:
+        return None, None
+    media, _, encoding = head.partition(";")
+    if encoding.strip().lower() != "base64":
+        return None, None
+    return media or "image/png", tail
 
-def do_http(method, url, headers=None, body_obj=None, timeout=CALL_TIMEOUT):
-    """One HTTP call. Returns (status or None, raw bytes)."""
-    data = None
-    heads = dict(headers or {})
-    if body_obj is not None:
-        data = json.dumps(body_obj).encode("utf-8")
-        heads.setdefault("Content-Type", "application/json")
-    req = Request(url, data=data, method=method, headers=heads)
-    try:
-        with urlopen(req, timeout=timeout) as resp:
-            return resp.status, resp.read()
-    except HTTPError as err:
+
+def _tool_names_openai(tools):
+    names = []
+    if isinstance(tools, list):
+        for tool in tools:
+            if _is_record(tool) and _is_record(tool.get("function")) and isinstance(tool["function"].get("name"), str):
+                names.append(tool["function"]["name"])
+    return names
+
+
+def _tool_names_anthropic(tools):
+    names = []
+    if isinstance(tools, list):
+        for tool in tools:
+            if _is_record(tool) and isinstance(tool.get("name"), str):
+                names.append(tool["name"])
+    return names
+
+
+def _json_documents(text):
+    """Every top-level JSON document embedded in a piece of prose."""
+    decoder = json.JSONDecoder()
+    docs = []
+    at = 0
+    while at < len(text):
+        open_at = text.find("{", at)
+        if open_at < 0:
+            break
         try:
-            return err.code, err.read()
-        except Exception:
-            return err.code, b""
-    except (URLError, TimeoutError, OSError, ValueError):
-        return None, b""
-
-
-def auth_headers(provider):
-    kind = provider.get("auth")
-    key = provider.get("key", "")
-    if kind == "bearer":
-        return {"Authorization": "Bearer " + key}
-    if kind == "x-api-key":
-        return {"x-api-key": key}
-    if kind == "x-goog-api-key":
-        return {"x-goog-api-key": key}
-    return {}
-
-
-# ---------------------------------------------------------------------------
-# Catalog
-# ---------------------------------------------------------------------------
-
-def models_from_ratings(ratings, provider_id):
-    rows = []
-    for row in ratings:
-        if row.get("provider") == provider_id:
-            rows.append({
-                "id": row["model"],
-                "free": bool(row.get("free")),
-                "context_length": row.get("context_length"),
-            })
-    return rows
-
-
-def probe_provider(env_url, provider):
-    """Ask one provider for its model list; None when the probe fails."""
-    base = env_url + provider["path"]
-    heads = auth_headers(provider)
-    try:
-        if provider["wire"] == "gemini":
-            status, raw = do_http("GET", base + "/v1beta/models", heads)
-            if status != 200:
-                return None
-            doc = json.loads(raw.decode("utf-8"))
-            rows = []
-            for item in doc.get("models", []):
-                name = item.get("name", "")
-                if name.startswith("models/"):
-                    name = name[len("models/"):]
-                rows.append({
-                    "id": name,
-                    "free": bool(item.get("free")),
-                    "context_length": item.get("context_length"),
-                })
-            return rows
-        status, raw = do_http("GET", base + "/v1/models", heads)
-        if status != 200:
-            return None
-        doc = json.loads(raw.decode("utf-8"))
-        rows = []
-        for item in doc.get("data", []):
-            rows.append({
-                "id": item.get("id"),
-                "free": bool(item.get("free")),
-                "context_length": item.get("context_length"),
-            })
-        return rows
-    except Exception:
-        return None
-
-
-def assemble_catalog(env_url, providers, ratings):
-    entries = []
-    for provider in providers:
-        models = probe_provider(env_url, provider)
-        if models is None:
-            models = models_from_ratings(ratings, provider["id"])
-        entries.append({
-            "id": provider["id"],
-            "base_url": provider["path"],
-            "key_env": provider.get("key_env", "") or "",
-            "wire": provider["wire"],
-            "models": models,
-        })
-    return {"providers": entries}
-
-
-# ---------------------------------------------------------------------------
-# Reading a client request (mirror the env's parse, for the usage formula)
-# ---------------------------------------------------------------------------
-
-def string_values(value):
-    if isinstance(value, str):
-        return [value]
-    if isinstance(value, list):
-        return [item for item in value if isinstance(item, str)]
-    return []
-
-
-def numeric_or_none(value):
-    return value if isinstance(value, (int, float)) and value == value else None
-
-
-def read_openai(body):
-    system_parts = []
-    user_text = ""
-    image = None
-    messages = body.get("messages") if isinstance(body.get("messages"), list) else []
-    for message in messages:
-        if not is_obj(message):
+            value, end = decoder.raw_decode(text, open_at)
+        except json.JSONDecodeError:
+            at = open_at + 1
             continue
-        if message.get("role") == "system":
-            text = text_blocks(message.get("content"))
-            if text != "":
-                system_parts.append(text)
-        elif message.get("role") == "user":
-            user_text = text_blocks(message.get("content"))
-            if isinstance(message.get("content"), list):
-                for block in message["content"]:
-                    if is_obj(block) and block.get("type") == "image_url" and is_obj(block.get("image_url")):
-                        found = image_fingerprint(block["image_url"].get("url"))
-                        if found is not None:
-                            image = found
-    tools = []
-    if isinstance(body.get("tools"), list):
-        for tool in body["tools"]:
-            if is_obj(tool) and is_obj(tool.get("function")) and isinstance(tool["function"].get("name"), str):
-                tools.append(tool["function"]["name"])
-    fmt = body.get("response_format") if is_obj(body.get("response_format")) else {}
-    max_tokens = numeric_or_none(body.get("max_tokens"))
-    if max_tokens is None:
-        max_tokens = numeric_or_none(body.get("max_completion_tokens"))
-    return {
-        "system_text": "\n".join(system_parts),
-        "user_text": user_text,
-        "tools": tools,
-        "max_tokens": max_tokens,
-        "stops": string_values(body.get("stop")),
-        "image_sha": image,
-        "json_mode": fmt.get("type") in ("json_object", "json_schema"),
-    }
+        if _is_record(value):
+            docs.append(value)
+        at = end
+    return docs
 
 
-def read_anthropic(body):
-    system_text = text_blocks(body.get("system"))
-    user_text = ""
-    image = None
-    messages = body.get("messages") if isinstance(body.get("messages"), list) else []
-    for message in messages:
-        if not is_obj(message) or message.get("role") != "user":
-            continue
-        user_text = text_blocks(message.get("content"))
-        if isinstance(message.get("content"), list):
-            for block in message["content"]:
-                if not is_obj(block) or block.get("type") != "image" or not is_obj(block.get("source")):
-                    continue
-                source = block["source"]
-                if source.get("type") == "base64" and isinstance(source.get("data"), str):
-                    try:
-                        image = short_hash_bytes(base64.b64decode(source["data"]))
-                    except Exception:
-                        pass
-                elif source.get("type") == "url":
-                    found = image_fingerprint(source.get("url"))
-                    if found is not None:
-                        image = found
-    tools = []
-    if isinstance(body.get("tools"), list):
-        for tool in body["tools"]:
-            if is_obj(tool) and isinstance(tool.get("name"), str):
-                tools.append(tool["name"])
-    return {
-        "system_text": system_text,
-        "user_text": user_text,
-        "tools": tools,
-        "max_tokens": numeric_or_none(body.get("max_tokens")),
-        "stops": string_values(body.get("stop_sequences")),
-        "image_sha": image,
-        "json_mode": False,
-    }
+class Brief:
+    """The trial brief: provider directory, quality table, manifest."""
 
-
-def read_gemini(body, model=""):
-    system_text = ""
-    instruction = body.get("systemInstruction")
-    if is_obj(instruction):
-        system_text = gemini_text(instruction.get("parts"))
-    user_text = ""
-    image = None
-    contents = body.get("contents") if isinstance(body.get("contents"), list) else []
-    for content in contents:
-        if not is_obj(content):
-            continue
-        if content.get("role") == "model":
-            continue
-        user_text = gemini_text(content.get("parts"))
-        if isinstance(content.get("parts"), list):
-            for part in content["parts"]:
-                if not is_obj(part):
-                    continue
-                if is_obj(part.get("inlineData")) and isinstance(part["inlineData"].get("data"), str):
-                    try:
-                        image = short_hash_bytes(base64.b64decode(part["inlineData"]["data"]))
-                    except Exception:
-                        pass
-                elif is_obj(part.get("fileData")) and isinstance(part["fileData"].get("fileUri"), str):
-                    found = image_fingerprint(part["fileData"]["fileUri"])
-                    if found is not None:
-                        image = found
-    tools = []
-    if isinstance(body.get("tools"), list):
-        for tool in body["tools"]:
-            if is_obj(tool) and isinstance(tool.get("functionDeclarations"), list):
-                for fn in tool["functionDeclarations"]:
-                    if is_obj(fn) and isinstance(fn.get("name"), str):
-                        tools.append(fn["name"])
-    config = body.get("generationConfig") if is_obj(body.get("generationConfig")) else {}
-    return {
-        "system_text": system_text,
-        "user_text": user_text,
-        "tools": tools,
-        "max_tokens": numeric_or_none(config.get("maxOutputTokens")),
-        "stops": string_values(config.get("stopSequences")),
-        "image_sha": image,
-        "json_mode": config.get("responseMimeType") == "application/json",
-        "model": model,
-    }
-
-
-def parse_by_wire(wire, body, model=""):
-    if wire == "openai":
-        return read_openai(body)
-    if wire == "anthropic":
-        return read_anthropic(body)
-    return read_gemini(body, model)
-
-
-def tokens_of(parsed, answer):
-    """The provider's token formula over the forwarded body and answer."""
-    prompt_len = len(parsed["system_text"]) + len(parsed["user_text"]) + len(",".join(parsed["tools"]))
-    return 1 + prompt_len // 4, 1 + len(answer) // 4
-
-
-# ---------------------------------------------------------------------------
-# Translating a client body into a provider's wire
-# ---------------------------------------------------------------------------
-
-def oai_to_ant_content(content):
-    if isinstance(content, str):
-        return content
-    if not isinstance(content, list):
-        return content
-    out = []
-    for block in content:
-        if not is_obj(block):
-            continue
-        if block.get("type") == "text" and isinstance(block.get("text"), str):
-            out.append({"type": "text", "text": block["text"]})
-        elif block.get("type") == "image_url" and is_obj(block.get("image_url")):
-            url = block["image_url"].get("url")
-            mime, data = split_data_url(url)
-            if data is not None:
-                out.append({"type": "image", "source": {"type": "base64", "media_type": mime, "data": data}})
-            elif isinstance(url, str):
-                out.append({"type": "image", "source": {"type": "url", "url": url}})
-        else:
-            out.append(copy.deepcopy(block))
-    return out
-
-
-def ant_to_oai_content(content):
-    if isinstance(content, str):
-        return content
-    if not isinstance(content, list):
-        return content
-    out = []
-    for block in content:
-        if not is_obj(block):
-            continue
-        if block.get("type") == "text":
-            out.append({"type": "text", "text": block.get("text", "")})
-        elif block.get("type") == "image" and is_obj(block.get("source")):
-            source = block["source"]
-            if source.get("type") == "base64":
-                media = source.get("media_type", "image/png")
-                out.append({"type": "image_url", "image_url": {"url": "data:%s;base64,%s" % (media, source.get("data", ""))}})
-            elif source.get("type") == "url":
-                out.append({"type": "image_url", "image_url": {"url": source.get("url", "")}})
-        else:
-            out.append(copy.deepcopy(block))
-    return out
-
-
-def oai_to_gemini_parts(content):
-    if isinstance(content, str):
-        return [{"text": content}]
-    if not isinstance(content, list):
-        return []
-    parts = []
-    for block in content:
-        if not is_obj(block):
-            continue
-        if block.get("type") == "text" and isinstance(block.get("text"), str):
-            parts.append({"text": block["text"]})
-        elif block.get("type") == "image_url" and is_obj(block.get("image_url")):
-            url = block["image_url"].get("url")
-            mime, data = split_data_url(url)
-            if data is not None:
-                parts.append({"inlineData": {"mimeType": mime, "data": data}})
-            elif isinstance(url, str):
-                parts.append({"fileData": {"fileUri": url}})
-    return parts
-
-
-def ant_to_gemini_parts(content):
-    if isinstance(content, str):
-        return [{"text": content}]
-    if not isinstance(content, list):
-        return []
-    parts = []
-    for block in content:
-        if not is_obj(block):
-            continue
-        if block.get("type") == "text" and isinstance(block.get("text"), str):
-            parts.append({"text": block["text"]})
-        elif block.get("type") == "image" and is_obj(block.get("source")):
-            source = block["source"]
-            if source.get("type") == "base64":
-                parts.append({"inlineData": {"mimeType": source.get("media_type", "image/png"), "data": source.get("data", "")}})
-            elif source.get("type") == "url":
-                parts.append({"fileData": {"fileUri": source.get("url", "")}})
-    return parts
-
-
-def build_anthropic_body(body, model):
-    """OpenAI client body -> Anthropic provider body (no response_format)."""
-    out = {"model": model}
-    system_texts = []
-    messages = []
-    for message in body.get("messages", []) or []:
-        if not is_obj(message):
-            continue
-        if message.get("role") == "system":
-            text = text_blocks(message.get("content"))
-            if text:
-                system_texts.append(text)
-        else:
-            item = dict(message)
-            item["content"] = oai_to_ant_content(message.get("content"))
-            messages.append(item)
-    if system_texts:
-        out["system"] = "\n".join(system_texts)
-    out["messages"] = messages
-    tools = []
-    for tool in body.get("tools", []) or []:
-        if is_obj(tool) and is_obj(tool.get("function")) and isinstance(tool["function"].get("name"), str):
-            fn = tool["function"]
-            entry = {"name": fn["name"]}
-            if "description" in fn:
-                entry["description"] = fn["description"]
-            if "parameters" in fn:
-                entry["input_schema"] = fn["parameters"]
-            tools.append(entry)
-    if tools:
-        out["tools"] = tools
-    max_tokens = numeric_or_none(body.get("max_tokens"))
-    if max_tokens is None:
-        max_tokens = numeric_or_none(body.get("max_completion_tokens"))
-    if max_tokens is not None:
-        out["max_tokens"] = max_tokens
-    stops = string_values(body.get("stop"))
-    if stops:
-        out["stop_sequences"] = stops
-    if isinstance(body.get("temperature"), (int, float)):
-        out["temperature"] = body["temperature"]
-    if body.get("stream") is True:
-        out["stream"] = True
-    return out
-
-
-def build_openai_body(body, model):
-    """Anthropic client body -> OpenAI provider body (never adds response_format)."""
-    out = {"model": model}
-    messages = []
-    system_text = text_blocks(body.get("system"))
-    if system_text:
-        messages.append({"role": "system", "content": system_text})
-    for message in body.get("messages", []) or []:
-        if not is_obj(message):
-            continue
-        item = dict(message)
-        item["content"] = ant_to_oai_content(message.get("content"))
-        messages.append(item)
-    out["messages"] = messages
-    tools = []
-    for tool in body.get("tools", []) or []:
-        if is_obj(tool) and isinstance(tool.get("name"), str):
-            fn = {"name": tool["name"]}
-            if "description" in tool:
-                fn["description"] = tool["description"]
-            if "input_schema" in tool:
-                fn["parameters"] = tool["input_schema"]
-            tools.append({"type": "function", "function": fn})
-    if tools:
-        out["tools"] = tools
-    if isinstance(body.get("max_tokens"), (int, float)):
-        out["max_tokens"] = body["max_tokens"]
-    stops = string_values(body.get("stop_sequences"))
-    if stops:
-        out["stop"] = stops
-    if isinstance(body.get("temperature"), (int, float)):
-        out["temperature"] = body["temperature"]
-    if body.get("stream") is True:
-        out["stream"] = True
-    return out
-
-
-def build_gemini_body(body, client_api):
-    """OpenAI or Anthropic client body -> Gemini provider body."""
-    out = {}
-    if client_api == "openai":
-        system_texts = []
-        contents = []
-        for message in body.get("messages", []) or []:
-            if not is_obj(message):
-                continue
-            if message.get("role") == "system":
-                text = text_blocks(message.get("content"))
-                if text:
-                    system_texts.append(text)
-            else:
-                role = "model" if message.get("role") == "assistant" else "user"
-                contents.append({"role": role, "parts": oai_to_gemini_parts(message.get("content"))})
-        if system_texts:
-            out["systemInstruction"] = {"parts": [{"text": "\n".join(system_texts)}]}
-        out["contents"] = contents
-        declarations = []
-        for tool in body.get("tools", []) or []:
-            if is_obj(tool) and is_obj(tool.get("function")) and isinstance(tool["function"].get("name"), str):
-                fn = tool["function"]
-                entry = {"name": fn["name"]}
-                if "description" in fn:
-                    entry["description"] = fn["description"]
-                if "parameters" in fn:
-                    entry["parameters"] = fn["parameters"]
-                declarations.append(entry)
-        if declarations:
-            out["tools"] = [{"functionDeclarations": declarations}]
-        config = {}
-        if isinstance(body.get("temperature"), (int, float)):
-            config["temperature"] = body["temperature"]
-        max_tokens = numeric_or_none(body.get("max_tokens"))
-        if max_tokens is None:
-            max_tokens = numeric_or_none(body.get("max_completion_tokens"))
-        if max_tokens is not None:
-            config["maxOutputTokens"] = max_tokens
-        stops = string_values(body.get("stop"))
-        if stops:
-            config["stopSequences"] = stops
-        fmt = body.get("response_format") if is_obj(body.get("response_format")) else {}
-        if fmt.get("type") in ("json_object", "json_schema"):
-            config["responseMimeType"] = "application/json"
-        if config:
-            out["generationConfig"] = config
-    else:
-        system_text = text_blocks(body.get("system"))
-        if system_text:
-            out["systemInstruction"] = {"parts": [{"text": system_text}]}
-        contents = []
-        for message in body.get("messages", []) or []:
-            if not is_obj(message):
-                continue
-            role = "model" if message.get("role") == "assistant" else "user"
-            contents.append({"role": role, "parts": ant_to_gemini_parts(message.get("content"))})
-        out["contents"] = contents
-        declarations = []
-        for tool in body.get("tools", []) or []:
-            if is_obj(tool) and isinstance(tool.get("name"), str):
-                entry = {"name": tool["name"]}
-                if "description" in tool:
-                    entry["description"] = tool["description"]
-                if "input_schema" in tool:
-                    entry["parameters"] = tool["input_schema"]
-                declarations.append(entry)
-        if declarations:
-            out["tools"] = [{"functionDeclarations": declarations}]
-        config = {}
-        if isinstance(body.get("temperature"), (int, float)):
-            config["temperature"] = body["temperature"]
-        if isinstance(body.get("max_tokens"), (int, float)):
-            config["maxOutputTokens"] = body["max_tokens"]
-        stops = string_values(body.get("stop_sequences"))
-        if stops:
-            config["stopSequences"] = stops
-        if config:
-            out["generationConfig"] = config
-    return out
-
-
-# ---------------------------------------------------------------------------
-# Reading a provider's answer
-# ---------------------------------------------------------------------------
-
-def sse_events(raw):
-    events = []
-    text = raw.decode("utf-8", "replace").replace("\r\n", "\n")
-    for chunk in text.split("\n\n"):
-        if chunk.strip() == "":
-            continue
-        event = None
-        data = []
-        for line in chunk.split("\n"):
-            if line.startswith("event:"):
-                event = line[len("event:"):].strip()
-            elif line.startswith("data:"):
-                data.append(line[len("data:"):].lstrip(" "))
-        if data:
-            events.append((event, "\n".join(data)))
-    return events
-
-
-def pull_openai_text(raw):
-    text = ""
-    for _event, data in sse_events(raw):
-        if data.strip() == "[DONE]":
-            continue
-        try:
-            doc = json.loads(data)
-        except Exception:
-            continue
-        for choice in doc.get("choices", []) or []:
-            delta = choice.get("delta") or {}
-            if isinstance(delta.get("content"), str):
-                text += delta["content"]
-    return text
-
-
-def pull_anthropic_text(raw):
-    text = ""
-    for event, data in sse_events(raw):
-        if event != "content_block_delta":
-            continue
-        try:
-            doc = json.loads(data)
-        except Exception:
-            continue
-        delta = doc.get("delta") or {}
-        if delta.get("type") == "text_delta" and isinstance(delta.get("text"), str):
-            text += delta["text"]
-    return text
-
-
-def pull_gemini_text(raw):
-    text = ""
-    for _event, data in sse_events(raw):
-        try:
-            doc = json.loads(data)
-        except Exception:
-            continue
-        for candidate in doc.get("candidates", []) or []:
-            content = candidate.get("content") or {}
-            for part in content.get("parts", []) or []:
-                if isinstance(part.get("text"), str):
-                    text += part["text"]
-    return text
-
-
-def openai_text_of(doc):
-    choices = doc.get("choices", []) or []
-    if not choices:
-        return ""
-    message = choices[0].get("message") or {}
-    content = message.get("content")
-    if isinstance(content, str):
-        return content
-    return flat_text(content)
-
-
-def gemini_text_of(doc):
-    candidates = doc.get("candidates", []) or []
-    if not candidates:
-        return ""
-    content = candidates[0].get("content") or {}
-    parts = content.get("parts", []) or []
-    return "".join(part.get("text", "") for part in parts if isinstance(part.get("text"), str))
-
-
-def refusal_reason(raw):
-    """What a refusal's error body says: 'budget', 'outage', 'fail' or 'other'.
-
-    The env's error envelope carries the provider's own words, and the words
-    differ by cause: a spent budget says so, an outage says the provider is
-    out, a single failed call says it refused this call. Reading that is
-    reading the provider's answer, nothing else.
-    """
-    try:
-        doc = json.loads(raw.decode("utf-8"))
-    except Exception:
-        return "other"
-    message = ""
-    if is_obj(doc):
-        err = doc.get("error")
-        if is_obj(err) and isinstance(err.get("message"), str):
-            message = err["message"]
-    if "budget is spent" in message:
-        return "budget"
-    if "is out" in message:
-        return "outage"
-    if "refused this call" in message:
-        return "fail"
-    return "other"
-
-
-# ---------------------------------------------------------------------------
-# Shared trial state
-# ---------------------------------------------------------------------------
-
-class Trial:
-    def __init__(self):
-        self.env_url = ""
+    def __init__(self, path):
         self.providers = []
-        self.by_id = {}
-        self.ratings = []
+        self.rows = []
         self.manifest = []
-        self.by_request = {}
-        self.catalog = {"providers": []}
-        self.calls = {}
-        self.refusals = {}
-        self.dead = set()
-        self.served = 0
-        self.lock = threading.Lock()
+        if not path:
+            return
+        with open(path, "r", encoding="utf-8") as handle:
+            text = handle.read()
+        for doc in _json_documents(text):
+            schema = doc.get("schema") or ""
+            if schema.endswith("/providers/v1"):
+                self.providers = doc.get("providers") or []
+            elif schema.endswith("/ratings/v1"):
+                self.rows = doc.get("ratings") or []
+            elif schema.endswith("/workload/v1"):
+                self.manifest = doc.get("manifest") or []
+
+    def directory(self):
+        """Provider id -> {wire, auth, key_env, key, path}."""
+        out = {}
+        for entry in self.providers:
+            if not _is_record(entry) or not isinstance(entry.get("id"), str):
+                continue
+            out[entry["id"]] = {
+                "wire": entry.get("wire"),
+                "auth": entry.get("auth"),
+                "key_env": entry.get("key_env"),
+                "key": entry.get("key"),
+                "path": entry.get("path") or ("/p/" + entry["id"]),
+            }
+        return out
 
 
-STATE = Trial()
+class Catalog:
+    """The registered catalog, built from the brief's quality table."""
+
+    def __init__(self, brief):
+        self.by_provider = {}
+        for row in brief.rows:
+            if not _is_record(row) or row.get("free") is not True:
+                continue
+            provider = row.get("provider")
+            model = row.get("model")
+            if not isinstance(provider, str) or not isinstance(model, str):
+                continue
+            self.by_provider.setdefault(provider, []).append(
+                {"id": model, "free": True, "context_length": row.get("context_length")}
+            )
+
+    def document(self, directory):
+        providers = []
+        for provider_id, entry in directory.items():
+            models = self.by_provider.get(provider_id, [])
+            providers.append(
+                {
+                    "id": provider_id,
+                    "base_url": entry.get("path"),
+                    "key_env": entry.get("key_env"),
+                    "wire": entry.get("wire"),
+                    "models": models,
+                }
+            )
+        return {"providers": providers}
+
+    def free_ids(self):
+        seen = []
+        for models in self.by_provider.values():
+            for model in models:
+                if model["id"] not in seen:
+                    seen.append(model["id"])
+        return seen
 
 
-# ---------------------------------------------------------------------------
-# One attempt at one provider
-# ---------------------------------------------------------------------------
-
-def attempt_provider(provider, model, client_api, body, stream):
-    """Try one provider once.
-
-    Returns ("ok", answer_text, forwarded_body) or ("no", reason, status).
-    reason is one of 'budget', 'outage', 'fail', 'other', 'unreachable'.
-    Only a 200, 402 or 429 counts against the provider's trial budget, so
-    only those count in the caller's books.
-    """
-    wire = provider["wire"]
-    base = STATE.env_url + provider["path"]
-    heads = auth_headers(provider)
-    try:
-        if wire == "openai":
-            if client_api == "anthropic":
-                forwarded = build_openai_body(body, model)
-            else:
-                forwarded = copy.deepcopy(body)
-                forwarded["model"] = model
-            if stream:
-                forwarded["stream"] = True
-                forwarded["stream_options"] = {"include_usage": True}
-            status, raw = do_http("POST", base + "/v1/chat/completions", heads, forwarded)
-            if status != 200:
-                return ("no", refusal_reason(raw) if status in (402, 429) else "other", status)
-            if stream:
-                return ("ok", pull_openai_text(raw), forwarded)
-            return ("ok", openai_text_of(json.loads(raw.decode("utf-8"))), forwarded)
-        if wire == "anthropic":
-            if client_api == "openai":
-                forwarded = build_anthropic_body(body, model)
-            else:
-                forwarded = copy.deepcopy(body)
-                forwarded["model"] = model
-            heads = dict(heads)
-            heads["anthropic-version"] = "2023-06-01"
-            status, raw = do_http("POST", base + "/v1/messages", heads, forwarded)
-            if status != 200:
-                return ("no", refusal_reason(raw) if status in (402, 429) else "other", status)
-            if stream:
-                return ("ok", pull_anthropic_text(raw), forwarded)
-            return ("ok", flat_text(json.loads(raw.decode("utf-8")).get("content")), forwarded)
-        forwarded = build_gemini_body(body, client_api)
-        action = "streamGenerateContent" if stream else "generateContent"
-        url = base + "/v1beta/models/" + quote(model, safe="") + ":" + action
-        if stream:
-            url += "?alt=sse"
-        status, raw = do_http("POST", url, heads, forwarded)
-        if status != 200:
-            return ("no", refusal_reason(raw) if status in (402, 429) else "other", status)
-        if stream:
-            return ("ok", pull_gemini_text(raw), forwarded)
-        return ("ok", gemini_text_of(json.loads(raw.decode("utf-8"))), forwarded)
-    except Exception:
-        return ("no", "unreachable", None)
-
-
-# ---------------------------------------------------------------------------
-# Routing: a function of the brief and the answers seen so far
-# ---------------------------------------------------------------------------
-
-def room_for(provider_id):
-    """Planned room for one more call, from the provider's best rating.
-
-    The strongest models are the scarcest: the router gives a provider
-    whose best model is top-tier room for one call, a mid-tier provider
-    room for two, and the rest room for three. These tiers come only from
-    the quality table in the brief; no hidden number is involved.
-    """
-    best = 0
-    for row in STATE.ratings:
-        if row.get("provider") == provider_id and row.get("free"):
-            best = max(best, row.get("rating_milli") or 0)
-    if best >= 1470:
-        return 1
-    if best >= 1450:
-        return 2
-    return 3
-
-
-def fits_requirements(row, requires, client_api, json_needed):
-    if not row.get("free"):
-        return False
+def _row_meets(row, requires):
     if requires.get("tools") and not row.get("tools"):
         return False
     if requires.get("vision") and not row.get("vision"):
         return False
     if requires.get("json") and not row.get("json"):
         return False
-    min_context = requires.get("min_context")
-    if min_context is not None and (row.get("context_length") or 0) < min_context:
-        return False
-    provider = STATE.by_id.get(row.get("provider"))
-    if provider is None:
-        return False
-    if json_needed and client_api == "openai" and provider["wire"] == "anthropic":
-        return False
+    floor = requires.get("min_context")
+    if isinstance(floor, int):
+        length = row.get("context_length")
+        if not isinstance(length, int) or length < floor:
+            return False
     return True
 
 
-def ranked_options(requires, client_api, json_needed):
-    """Eligible (provider, model) pairs, best first.
-
-    The first pass only lists providers that still have planned room: a
-    provider that already spent its room is not picked while any provider
-    with room is left. The fallback pass lists every provider not
-    retired, ordered by how much it has already proven: fewest refusals
-    first, then the longest run of successful calls (a provider that
-    served several calls without failing has shown those call numbers
-    safe), then strongest rating. The two passes come back as one list,
-    fallback after primary, so a request whose primary is exhausted or
-    already tried still gets a fallback try instead of going unserved
-    while an eligible provider exists. Providers already retired are
-    left out of both passes.
-
-    Order inside a pass: strongest rating first; a provider whose wire
-    matches the client's wire next; then a provider that has not refused
-    yet (a provider that already burned one call is tried only when
-    nothing cleaner is left at that rating); then the provider with the
-    most planned room left; then a fixed provider/model order, so the
-    choice is deterministic.
-    """
-    primary = []
-    fallback = []
-    for row in STATE.ratings:
-        if not fits_requirements(row, requires, client_api, json_needed):
-            continue
-        provider = STATE.by_id[row["provider"]]
-        if provider["id"] in STATE.dead:
-            continue
-        same_wire = 0 if provider["wire"] == client_api else 1
-        refused = STATE.refusals.get(provider["id"], 0)
-        room = room_for(provider["id"]) - STATE.calls.get(provider["id"], 0)
-        entry = (-(row.get("rating_milli") or 0), same_wire, refused, -room, provider["id"], row["model"], provider, row["model"])
-        fallback.append(entry)
-        if room > 0:
-            primary.append(entry)
-    if primary:
-        primary.sort()
-    fallback.sort(key=lambda item: (item[2], -STATE.calls.get(item[6]["id"], 0), item[0], item[4], item[5]))
-    seen = set()
-    merged = []
-    for item in primary + fallback:
-        tag = (item[6]["id"], item[7])
-        if tag in seen:
-            continue
-        seen.add(tag)
-        merged.append(item)
-    return [(item[6], item[7]) for item in merged]
+def _demand_of(requires):
+    count = 0
+    for key in ("vision", "tools", "json", "min_context"):
+        if requires.get(key):
+            count += 1
+    return count
 
 
-def lookup_work():
-    try:
-        status, raw = do_http("GET", STATE.env_url + "/work", timeout=5.0)
-        if status != 200:
-            return None
-        doc = json.loads(raw.decode("utf-8"))
-        return doc if is_obj(doc) else None
-    except Exception:
-        return None
+class Router:
+    """Adaptive whole-workload planner over the brief's quality table."""
 
+    def __init__(self, rows, manifest):
+        self.rows = [row for row in rows if _is_record(row) and row.get("free") is True]
+        self.manifest = manifest
+        self.calls = {}
+        self.struck = set()
+        self.lock = threading.Lock()
 
-def needs_of(client_api, body):
-    """Requirements for this request: /work's next id, else manifest order."""
-    work = lookup_work()
-    if work is not None:
-        next_id = work.get("next")
-        if isinstance(next_id, str) and next_id in STATE.by_request:
-            return dict(STATE.by_request[next_id].get("requires") or {})
-    if STATE.served < len(STATE.manifest):
-        return dict(STATE.manifest[STATE.served].get("requires") or {})
-    return infer_needs(client_api, body)
-
-
-def infer_needs(client_api, body):
-    needs = {}
-    tools = body.get("tools")
-    if isinstance(tools, list) and tools:
-        needs["tools"] = True
-    if client_api == "openai":
-        for message in body.get("messages", []) or []:
-            if not is_obj(message) or not isinstance(message.get("content"), list):
+    def _eligible(self, requires, client_api, wants_json):
+        out = []
+        for row in self.rows:
+            if row.get("provider") in self.struck:
                 continue
-            for block in message["content"]:
-                if is_obj(block) and block.get("type") == "image_url":
-                    needs["vision"] = True
-        fmt = body.get("response_format")
-        if is_obj(fmt) and fmt.get("type") in ("json_object", "json_schema"):
-            needs["json"] = True
-    else:
-        for message in body.get("messages", []) or []:
-            if not is_obj(message) or not isinstance(message.get("content"), list):
+            if not _row_meets(row, requires):
                 continue
-            for block in message["content"]:
-                if is_obj(block) and block.get("type") == "image":
-                    needs["vision"] = True
-    return needs
+            if wants_json and client_api == "openai":
+                wire = _WIRE_OF.get(row.get("provider"))
+                if wire == "anthropic":
+                    continue
+            out.append(row)
+        return out
 
+    def _plan(self, remaining, calls, wants_json):
+        """Best pick per remaining request, under the allowance.
 
-def serve_one(client_api, body, requires):
-    stream = body.get("stream") is True
-    json_needed = (
-        client_api == "openai"
-        and is_obj(body.get("response_format"))
-        and body["response_format"].get("type") in ("json_object", "json_schema")
-    )
-    tried = set()
-    attempts = 0
-    while attempts < MAX_TRIES_PER_REQUEST:
-        options = ranked_options(requires, client_api, json_needed)
-        pick = None
-        for provider, model in options:
-            if provider["id"] not in tried:
-                pick = (provider, model)
-                break
-        if pick is None:
-            break
-        provider, model = pick
-        tried.add(provider["id"])
-        attempts += 1
-        kind, first, second = attempt_provider(provider, model, client_api, body, stream)
-        if kind == "ok":
-            STATE.calls[provider["id"]] = STATE.calls.get(provider["id"], 0) + 1
-            sys.stderr.write("served via %s/%s\n" % (provider["id"], model))
-            return client_reply(client_api, body, model, first, second, provider["wire"])
-        if second in (402, 429):
-            STATE.calls[provider["id"]] = STATE.calls.get(provider["id"], 0) + 1
-        if first in ("budget", "outage"):
-            STATE.dead.add(provider["id"])
-        else:
-            STATE.refusals[provider["id"]] = STATE.refusals.get(provider["id"], 0) + 1
-            if STATE.refusals[provider["id"]] >= 2:
-                STATE.dead.add(provider["id"])
-    return failure_reply(client_api)
-
-
-def handle_client(client_api, body):
-    with STATE.lock:
-        requires = needs_of(client_api, body)
-        answered = serve_one(client_api, body, requires)
-        STATE.served += 1
-        return answered
-
-
-# ---------------------------------------------------------------------------
-# Answers in the client's wire
-# ---------------------------------------------------------------------------
-
-def slice_text(text):
-    if text == "":
-        return [""]
-    return [text[i:i + SLICE_LEN] for i in range(0, len(text), SLICE_LEN)]
-
-
-def sse_json(payload):
-    return "data: " + json.dumps(payload) + "\n\n"
-
-
-def sse_named(name, payload):
-    return "event: " + name + "\ndata: " + json.dumps(payload) + "\n\n"
-
-
-def client_reply(client_api, body, model, text, forwarded, provider_wire):
-    parsed = parse_by_wire(provider_wire, forwarded, model)
-    in_tokens, out_tokens = tokens_of(parsed, text)
-    stream = body.get("stream") is True
-    if client_api == "openai":
-        if not stream:
-            payload = {
-                "id": "chatcmpl-sim",
-                "object": "chat.completion",
-                "created": EPOCH_CREATED,
-                "model": model,
-                "choices": [{
-                    "index": 0,
-                    "message": {"role": "assistant", "content": text},
-                    "finish_reason": "stop",
-                    "logprobs": None,
-                }],
-                "usage": {
-                    "prompt_tokens": in_tokens,
-                    "completion_tokens": out_tokens,
-                    "total_tokens": in_tokens + out_tokens,
-                },
-            }
-            return 200, "application/json", json.dumps(payload).encode("utf-8")
-        frames = []
-        base_chunk = {"id": "chatcmpl-sim", "object": "chat.completion.chunk", "created": EPOCH_CREATED, "model": model}
-        first = dict(base_chunk)
-        first["choices"] = [{"index": 0, "delta": {"role": "assistant", "content": ""}, "finish_reason": None}]
-        frames.append(sse_json(first))
-        for piece in slice_text(text):
-            chunk = dict(base_chunk)
-            chunk["choices"] = [{"index": 0, "delta": {"content": piece}, "finish_reason": None}]
-            frames.append(sse_json(chunk))
-        last = dict(base_chunk)
-        last["choices"] = [{"index": 0, "delta": {}, "finish_reason": "stop"}]
-        frames.append(sse_json(last))
-        usage_chunk = dict(base_chunk)
-        usage_chunk["choices"] = []
-        usage_chunk["usage"] = {
-            "prompt_tokens": in_tokens,
-            "completion_tokens": out_tokens,
-            "total_tokens": in_tokens + out_tokens,
-        }
-        frames.append(sse_json(usage_chunk))
-        frames.append("data: [DONE]\n\n")
-        return 200, "text/event-stream; charset=utf-8", "".join(frames).encode("utf-8")
-    if not stream:
-        payload = {
-            "id": "msg_sim",
-            "type": "message",
-            "role": "assistant",
-            "model": model,
-            "content": [{"type": "text", "text": text}],
-            "stop_reason": "end_turn",
-            "stop_sequence": None,
-            "usage": {"input_tokens": in_tokens, "output_tokens": out_tokens},
-        }
-        return 200, "application/json", json.dumps(payload).encode("utf-8")
-    frames = []
-    frames.append(sse_named("message_start", {
-        "type": "message_start",
-        "message": {
-            "id": "msg_sim", "type": "message", "role": "assistant", "model": model,
-            "content": [], "stop_reason": None, "stop_sequence": None,
-            "usage": {"input_tokens": in_tokens, "output_tokens": 0},
-        },
-    }))
-    frames.append(sse_named("content_block_start", {
-        "type": "content_block_start", "index": 0,
-        "content_block": {"type": "text", "text": ""},
-    }))
-    for piece in slice_text(text):
-        frames.append(sse_named("content_block_delta", {
-            "type": "content_block_delta", "index": 0,
-            "delta": {"type": "text_delta", "text": piece},
-        }))
-    frames.append(sse_named("content_block_stop", {"type": "content_block_stop", "index": 0}))
-    frames.append(sse_named("message_delta", {
-        "type": "message_delta",
-        "delta": {"stop_reason": "end_turn", "stop_sequence": None},
-        "usage": {"output_tokens": out_tokens},
-    }))
-    frames.append(sse_named("message_stop", {"type": "message_stop"}))
-    return 200, "text/event-stream; charset=utf-8", "".join(frames).encode("utf-8")
-
-
-def failure_reply(client_api):
-    if client_api == "openai":
-        payload = {"error": {"message": "all providers refused the request", "type": "api_error", "code": "all_providers_failed", "param": None}}
-    else:
-        payload = {"type": "error", "error": {"type": "api_error", "message": "all providers refused the request"}}
-    return 502, "application/json", json.dumps(payload).encode("utf-8")
-
-
-# ---------------------------------------------------------------------------
-# HTTP server
-# ---------------------------------------------------------------------------
-
-class AggregatorServer(ThreadingHTTPServer):
-    daemon_threads = True
-    allow_reuse_address = True
-
-
-class AggregatorHandler(BaseHTTPRequestHandler):
-    def log_message(self, *args):
-        pass
-
-    def send_bytes(self, status, payload, content_type):
-        self.send_response(status)
-        self.send_header("Content-Type", content_type)
-        self.send_header("Content-Length", str(len(payload)))
-        self.end_headers()
-        self.wfile.write(payload)
-
-    def do_GET(self):
-        path = urlparse(self.path).path
-        if path != "/v1/models":
-            self.send_bytes(404, b'{"error":"not_found"}', "application/json")
-            return
-        free_ids = []
-        seen = set()
-        for provider in STATE.catalog.get("providers", []):
-            for model in provider.get("models", []) or []:
-                if model.get("free") is True and isinstance(model.get("id"), str) and model["id"] not in seen:
-                    seen.add(model["id"])
-                    free_ids.append(model["id"])
-        if self.headers.get("x-api-key") is not None:
-            payload = {
-                "data": [{"type": "model", "id": mid, "display_name": mid, "created_at": "2026-01-01T00:00:00Z", "free": True} for mid in free_ids],
-                "has_more": False,
-            }
-        else:
-            payload = {
-                "object": "list",
-                "data": [{"id": mid, "object": "model", "created": EPOCH_CREATED, "owned_by": "free-model-aggregator", "free": True} for mid in free_ids],
-            }
-        self.send_bytes(200, json.dumps(payload).encode("utf-8"), "application/json")
-
-    def do_POST(self):
-        path = urlparse(self.path).path
-        length = int(self.headers.get("Content-Length") or 0)
-        raw = self.rfile.read(length) if length > 0 else b""
-        try:
-            body = json.loads(raw.decode("utf-8")) if raw else {}
-        except Exception:
-            body = {}
-        if not is_obj(body):
-            body = {}
-        if path == "/v1/chat/completions":
-            status, content_type, payload = handle_client("openai", body)
-        elif path == "/v1/messages":
-            status, content_type, payload = handle_client("anthropic", body)
-        else:
-            self.send_bytes(404, b'{"error":"not_found"}', "application/json")
-            return
-        self.send_bytes(status, payload, content_type)
-
-
-# ---------------------------------------------------------------------------
-# Entry points
-# ---------------------------------------------------------------------------
-
-def print_catalog():
-    prompt_file = os.environ.get("MAKEFUN_PROMPT_FILE")
-    if not prompt_file:
-        print('{"providers":[]}')
-        return 0
-    try:
-        providers, ratings, _manifest = read_brief(prompt_file)
-    except Exception:
-        print('{"providers":[]}')
-        return 0
-    env_url = os.environ.get("MAKEFUN_ENV_URL", "")
-    if env_url:
-        catalog = assemble_catalog(env_url.rstrip("/"), providers, ratings)
-    else:
-        catalog = {"providers": [{
-            "id": provider["id"],
-            "base_url": provider["path"],
-            "key_env": provider.get("key_env", "") or "",
-            "wire": provider["wire"],
-            "models": models_from_ratings(ratings, provider["id"]),
-        } for provider in providers]}
-    print(json.dumps(catalog, separators=(",", ":")))
-    return 0
-
-
-def register(env_url, port, catalog):
-    for _attempt in range(60):
-        status, _raw = do_http(
-            "POST", env_url + "/register",
-            {"Content-Type": "application/json"},
-            {"protocol_version": 1, "port": port, "catalog": catalog},
-            timeout=5.0,
+        wants_json is the client's own JSON-mode signal: only a wire that
+        can carry it may serve such a request, whatever the model table
+        says about the model's JSON support.
+        """
+        order = sorted(
+            remaining,
+            key=lambda item: (-_demand_of(item.get("requires") or {}), -item.get("weight", 1), item.get("id") or ""),
         )
-        if status == 200:
-            return True
-        time.sleep(0.5)
-    return False
+        planned = dict(calls)
+        picks = {}
+        for item in order:
+            requires = item.get("requires") or {}
+            cands = self._eligible(requires, item.get("api"), wants_json)
+            cands.sort(key=lambda row: (-row.get("rating_milli", 0), row.get("provider") or "", row.get("model") or ""))
+            pick = None
+            for row in cands:
+                if planned.get(row.get("provider"), 0) < ALLOWANCE.get(row.get("provider"), 1):
+                    pick = row
+                    break
+            if pick is None and cands:
+                pick = cands[0]
+            if pick is not None:
+                picks[item.get("id")] = pick
+                planned[pick.get("provider")] = planned.get(pick.get("provider"), 0) + 1
+        return picks
+
+    def candidates(self, request_id, index, wants_json):
+        """Ordered tries for one request: the plan's pick, then the rest."""
+        with self.lock:
+            manifest = self.manifest
+            item = manifest[index] if 0 <= index < len(manifest) else None
+            if item is None:
+                return []
+            requires = item.get("requires") or {}
+            remaining = manifest[index:]
+            picks = self._plan(remaining, self.calls, wants_json)
+            first = picks.get(request_id)
+            cands = self._eligible(requires, item.get("api"), wants_json)
+            def sort_key(row):
+                over = 1 if self.calls.get(row.get("provider"), 0) >= ALLOWANCE.get(row.get("provider"), 1) else 0
+                return (over, -row.get("rating_milli", 0), row.get("provider") or "", row.get("model") or "")
+
+            ordered = sorted(cands, key=sort_key)
+            if first is not None:
+                ordered = [first] + [row for row in ordered if row is not first]
+            seen = set()
+            out = []
+            for row in ordered:
+                key = (row.get("provider"), row.get("model"))
+                if key in seen:
+                    continue
+                seen.add(key)
+                out.append(row)
+            return out
+
+    def note_call(self, provider):
+        with self.lock:
+            self.calls[provider] = self.calls.get(provider, 0) + 1
+
+    def note_spent(self, provider):
+        with self.lock:
+            self.struck.add(provider)
 
 
-def main():
-    if "--list" in sys.argv[1:]:
-        return print_catalog()
-    prompt_file = os.environ.get("MAKEFUN_PROMPT_FILE")
-    env_url = os.environ.get("MAKEFUN_ENV_URL")
-    if not prompt_file or not env_url:
-        sys.stderr.write("main.py: MAKEFUN_PROMPT_FILE and MAKEFUN_ENV_URL are required\n")
-        return 1
+_WIRE_OF = {}
+
+
+def _auth_headers(auth, key):
+    if auth == "bearer":
+        return {"Authorization": "Bearer %s" % key}
+    if auth == "x-api-key":
+        return {"x-api-key": key}
+    if auth == "x-goog-api-key":
+        return {"x-goog-api-key": key}
+    return {}
+
+
+def _openai_messages(client):
+    """Client messages as OpenAI messages, whatever wire the client used.
+
+    An Anthropic client carries its system prompt in a separate `system`
+    field, its tools in Anthropic shape, and its stops as `stop_sequences`;
+    all three must land in the OpenAI body, or the provider echoes them
+    absent and the request fails its echo checks.
+    """
+    messages = []
+    system_text = _text_of(client.get("system")) if isinstance(client.get("system"), (str, list)) else ""
+    if system_text:
+        messages.append({"role": "system", "content": system_text})
+    for message in client.get("messages") or []:
+        if not _is_record(message):
+            continue
+        role = message.get("role")
+        content = message.get("content")
+        if role == "system":
+            text = _text_of(content)
+            if text:
+                messages.append({"role": "system", "content": text})
+            continue
+        if isinstance(content, str):
+            messages.append({"role": role or "user", "content": content})
+            continue
+        parts = []
+        if isinstance(content, list):
+            for block in content:
+                if not _is_record(block):
+                    continue
+                if block.get("type") == "text" and isinstance(block.get("text"), str):
+                    parts.append({"type": "text", "text": block["text"]})
+                elif block.get("type") == "image_url" and _is_record(block.get("image_url")):
+                    parts.append(block)
+                elif block.get("type") == "image" and _is_record(block.get("source")):
+                    src = block["source"]
+                    if src.get("type") == "base64" and isinstance(src.get("data"), str):
+                        parts.append({"type": "image_url", "image_url": {"url": _data_url(src.get("media_type") or "image/png", src["data"])}})
+                    elif src.get("type") == "url" and isinstance(src.get("url"), str):
+                        parts.append({"type": "image_url", "image_url": {"url": src["url"]}})
+        messages.append({"role": role or "user", "content": parts})
+    return messages
+
+
+def _openai_tools(client):
+    """Client tools as OpenAI tools, whatever wire the client used."""
+    tools = client.get("tools")
+    if not isinstance(tools, list):
+        return None
+    if tools and _is_record(tools[0]) and isinstance(tools[0].get("name"), str) and "function" not in tools[0]:
+        out = []
+        for tool in tools:
+            if not _is_record(tool):
+                continue
+            out.append(
+                {
+                    "type": "function",
+                    "function": {
+                        "name": tool.get("name"),
+                        "description": tool.get("description"),
+                        "parameters": tool.get("input_schema") or {"type": "object", "properties": {}},
+                    },
+                }
+            )
+        return out
+    return tools
+
+
+def _openai_body(client, model, stream):
+    """Translate a client request body into an OpenAI-wire provider body."""
+    body = {"model": model}
+    body["messages"] = _openai_messages(client)
+    tools = _openai_tools(client)
+    if tools is not None:
+        body["tools"] = tools
+    if client.get("tool_choice") is not None:
+        choice = client["tool_choice"]
+        body["tool_choice"] = "auto" if _is_record(choice) and choice.get("type") == "auto" else choice
+    for key in ("max_tokens", "max_completion_tokens", "temperature", "response_format"):
+        if client.get(key) is not None:
+            body[key] = client[key]
+    stops = None
+    if isinstance(client.get("stop"), str):
+        stops = [client["stop"]]
+    elif isinstance(client.get("stop"), list):
+        stops = [s for s in client["stop"] if isinstance(s, str)]
+    elif isinstance(client.get("stop_sequences"), list):
+        stops = [s for s in client["stop_sequences"] if isinstance(s, str)]
+    if stops:
+        body["stop"] = stops
+    if stream:
+        body["stream"] = True
+        body["stream_options"] = {"include_usage": True}
+    return body
+
+
+def _anthropic_messages(client):
+    """Client messages as Anthropic content blocks, plus the system text."""
+    system_text = ""
+    messages = []
+    api_messages = client.get("messages")
+    if isinstance(api_messages, list):
+        for message in api_messages:
+            if not _is_record(message):
+                continue
+            role = message.get("role")
+            if role == "system":
+                text = _text_of(message.get("content"))
+                if text:
+                    system_text = (system_text + "\n" + text).strip() if system_text else text
+                continue
+            blocks = []
+            content = message.get("content")
+            if isinstance(content, str):
+                if content:
+                    blocks.append({"type": "text", "text": content})
+            elif isinstance(content, list):
+                for block in content:
+                    if not _is_record(block):
+                        continue
+                    if block.get("type") == "text" and isinstance(block.get("text"), str):
+                        blocks.append({"type": "text", "text": block["text"]})
+                    elif block.get("type") == "image_url" and _is_record(block.get("image_url")):
+                        media, data = _split_data_url(block["image_url"].get("url"))
+                        if data is not None:
+                            blocks.append({"type": "image", "source": {"type": "base64", "media_type": media, "data": data}})
+                        elif isinstance(block["image_url"].get("url"), str):
+                            blocks.append({"type": "image", "source": {"type": "url", "url": block["image_url"]["url"]}})
+            elif content is not None:
+                blocks.append({"type": "text", "text": str(content)})
+            messages.append({"role": role or "user", "content": blocks})
+    return system_text, messages
+
+
+def _anthropic_body(client, model, stream):
+    """Translate a client request body into an Anthropic-wire provider body."""
+    if client.get("messages") is not None and isinstance(client.get("system"), (str, list)):
+        system_text = _text_of(client.get("system"))
+        messages = []
+        for message in client.get("messages") or []:
+            if not _is_record(message):
+                continue
+            blocks = []
+            content = message.get("content")
+            if isinstance(content, str):
+                if content:
+                    blocks.append({"type": "text", "text": content})
+            elif isinstance(content, list):
+                for block in content:
+                    if not _is_record(block):
+                        continue
+                    if block.get("type") == "text" and isinstance(block.get("text"), str):
+                        blocks.append({"type": "text", "text": block["text"]})
+                    elif block.get("type") == "image" and _is_record(block.get("source")):
+                        blocks.append(block)
+            messages.append({"role": message.get("role") or "user", "content": blocks})
+    else:
+        system_text, messages = _anthropic_messages(client)
+    body = {"model": model}
+    if system_text:
+        body["system"] = system_text
+    body["messages"] = messages
+    tools = client.get("tools")
+    if isinstance(tools, list) and tools and _is_record(tools[0]) and "function" in tools[0]:
+        body["tools"] = [
+            {"name": tool["function"].get("name"), "description": tool["function"].get("description"),
+             "input_schema": tool["function"].get("parameters") or {"type": "object", "properties": {}}}
+            for tool in tools
+            if _is_record(tool) and _is_record(tool.get("function"))
+        ]
+    elif isinstance(tools, list):
+        body["tools"] = tools
+    if client.get("tool_choice") == "auto":
+        body["tool_choice"] = {"type": "auto"}
+    elif client.get("tool_choice") is not None:
+        body["tool_choice"] = client["tool_choice"]
+    max_tokens = client.get("max_tokens")
+    if not isinstance(max_tokens, int):
+        max_tokens = 1024
+    body["max_tokens"] = max_tokens
+    if isinstance(client.get("stop"), str):
+        body["stop_sequences"] = [client["stop"]]
+    elif isinstance(client.get("stop"), list):
+        body["stop_sequences"] = [s for s in client["stop"] if isinstance(s, str)]
+    elif isinstance(client.get("stop_sequences"), list):
+        body["stop_sequences"] = [s for s in client["stop_sequences"] if isinstance(s, str)]
+    if isinstance(client.get("temperature"), (int, float)):
+        body["temperature"] = client["temperature"]
+    if stream:
+        body["stream"] = True
+    return body
+
+
+def _gemini_parts(client):
+    """Client messages as Gemini contents, plus system text and tools."""
+    system_text = ""
+    contents = []
+    if isinstance(client.get("system"), (str, list)):
+        system_text = _text_of(client.get("system"))
+    messages = client.get("messages")
+    if isinstance(messages, list):
+        for message in messages:
+            if not _is_record(message):
+                continue
+            role = message.get("role")
+            if role == "system":
+                text = _text_of(message.get("content"))
+                if text:
+                    system_text = (system_text + "\n" + text).strip() if system_text else text
+                continue
+            parts = []
+            content = message.get("content")
+            if isinstance(content, str):
+                if content:
+                    parts.append({"text": content})
+            elif isinstance(content, list):
+                for block in content:
+                    if not _is_record(block):
+                        continue
+                    if block.get("type") == "text" and isinstance(block.get("text"), str):
+                        parts.append({"text": block["text"]})
+                    elif block.get("type") == "image_url" and _is_record(block.get("image_url")):
+                        media, data = _split_data_url(block["image_url"].get("url"))
+                        if data is not None:
+                            parts.append({"inlineData": {"mimeType": media, "data": data}})
+                        elif isinstance(block["image_url"].get("url"), str):
+                            parts.append({"fileData": {"fileUri": block["image_url"]["url"]}})
+                    elif block.get("type") == "image" and _is_record(block.get("source")):
+                        src = block["source"]
+                        if src.get("type") == "base64" and isinstance(src.get("data"), str):
+                            parts.append({"inlineData": {"mimeType": src.get("media_type") or "image/png", "data": src["data"]}})
+                        elif src.get("type") == "url" and isinstance(src.get("url"), str):
+                            parts.append({"fileData": {"fileUri": src["url"]}})
+            contents.append({"role": "model" if role == "assistant" else "user", "parts": parts})
+    return system_text, contents
+
+
+def _gemini_body(client, model, stream, wants_json):
+    """Translate a client request body into a Gemini generateContent body."""
+    system_text, contents = _gemini_parts(client)
+    body = {"contents": contents}
+    if system_text:
+        body["systemInstruction"] = {"parts": [{"text": system_text}]}
+    tools = client.get("tools")
+    declarations = []
+    if isinstance(tools, list):
+        for tool in tools:
+            if _is_record(tool) and _is_record(tool.get("function")):
+                fn = tool["function"]
+                declarations.append({"name": fn.get("name"), "description": fn.get("description"),
+                                     "parameters": fn.get("parameters") or {"type": "object", "properties": {}}})
+            elif _is_record(tool) and isinstance(tool.get("name"), str):
+                declarations.append({"name": tool.get("name"), "description": tool.get("description"),
+                                     "parameters": tool.get("input_schema") or {"type": "object", "properties": {}}})
+    if declarations:
+        body["tools"] = [{"functionDeclarations": declarations}]
+    config = {}
+    if isinstance(client.get("temperature"), (int, float)):
+        config["temperature"] = client["temperature"]
+    max_tokens = client.get("max_tokens")
+    if isinstance(max_tokens, int):
+        config["maxOutputTokens"] = max_tokens
+    stops = None
+    if isinstance(client.get("stop"), str):
+        stops = [client["stop"]]
+    elif isinstance(client.get("stop"), list):
+        stops = [s for s in client["stop"] if isinstance(s, str)]
+    elif isinstance(client.get("stop_sequences"), list):
+        stops = [s for s in client["stop_sequences"] if isinstance(s, str)]
+    if stops:
+        config["stopSequences"] = stops
+    if wants_json:
+        config["responseMimeType"] = "application/json"
+    if config:
+        body["generationConfig"] = config
+    return body
+
+
+def _call_provider(env_url, info, row, client, stream, wants_json):
+    """One provider call. Returns (ok, text, usage, stop, cause)."""
+    wire = info.get("wire")
+    provider = row.get("provider")
+    model = row.get("model")
+    base = (env_url or "").rstrip("/")
+    path = (info.get("path") or ("/p/" + provider))
+    if wire == "openai":
+        url = base + path + "/v1/chat/completions"
+        payload = _openai_body(client, model, stream)
+    elif wire == "anthropic":
+        url = base + path + "/v1/messages"
+        payload = _anthropic_body(client, model, stream)
+    elif wire == "gemini":
+        verb = "streamGenerateContent" if stream else "generateContent"
+        url = base + path + "/v1beta/models/" + urllib.parse.quote(model, safe="") + ":" + verb
+        if stream:
+            url += "?alt=sse"
+        payload = _gemini_body(client, model, stream, wants_json)
+    else:
+        return False, "", None, None, "unknown-wire"
+    data = json.dumps(payload).encode("utf-8")
+    headers = {"Content-Type": "application/json"}
+    headers.update(_auth_headers(info.get("auth"), info.get("key")))
+    if wire == "anthropic":
+        headers["anthropic-version"] = ANTHROPIC_VERSION
+    request = urllib.request.Request(url, data=data, headers=headers, method="POST")
     try:
-        providers, ratings, manifest = read_brief(prompt_file)
+        with urllib.request.urlopen(request, timeout=PROVIDER_TIMEOUT_SECONDS) as response:
+            raw = response.read().decode("utf-8", "replace")
+            status = response.status
+    except urllib.error.HTTPError as err:
+        raw = err.read().decode("utf-8", "replace")
+        status = err.code
     except Exception as err:
-        sys.stderr.write("main.py: cannot read brief: %s\n" % err)
+        return False, "", None, None, "transport:%s" % err.__class__.__name__
+    if status < 200 or status >= 300:
+        return False, "", None, None, _refusal_cause(raw)
+    if wire == "openai":
+        return _read_openai(raw, stream)
+    if wire == "anthropic":
+        return _read_anthropic(raw, stream)
+    return _read_gemini(raw, stream)
+
+
+def _refusal_cause(raw):
+    """Why a provider refused, from its own error message."""
+    message = ""
+    try:
+        parsed = json.loads(raw)
+        if _is_record(parsed):
+            error = parsed.get("error")
+            if _is_record(error) and isinstance(error.get("message"), str):
+                message = error["message"]
+            elif isinstance(parsed.get("message"), str):
+                message = parsed["message"]
+    except json.JSONDecodeError:
+        message = raw
+    if "budget is spent" in message:
+        return "spent"
+    if " is out" in message:
+        return "outage"
+    if "refused this call" in message:
+        return "transient"
+    return "refused"
+
+
+def _read_openai(raw, stream):
+    if not stream:
+        try:
+            value = json.loads(raw)
+        except json.JSONDecodeError:
+            return False, "", None, None, "bad-answer"
+        choices = value.get("choices") or []
+        if not choices or not _is_record(choices[0]):
+            return False, "", None, None, "bad-answer"
+        message = choices[0].get("message") or {}
+        text = message.get("content")
+        if not isinstance(text, str):
+            text = _text_of(message.get("content"))
+        usage = value.get("usage") or {}
+        return True, text, (usage.get("prompt_tokens"), usage.get("completion_tokens")), "stop", None
+    text = ""
+    usage = None
+    stop = None
+    for frame in raw.split("\n\n"):
+        frame = frame.strip()
+        if not frame or frame == "data: [DONE]":
+            continue
+        if frame.startswith("data:"):
+            frame = frame[5:].strip()
+        try:
+            chunk = json.loads(frame)
+        except json.JSONDecodeError:
+            continue
+        if not _is_record(chunk):
+            continue
+        if _is_record(chunk.get("usage")):
+            usage = (chunk["usage"].get("prompt_tokens"), chunk["usage"].get("completion_tokens"))
+        choices = chunk.get("choices") or []
+        if not choices or not _is_record(choices[0]):
+            continue
+        delta = choices[0].get("delta") or {}
+        if isinstance(delta.get("content"), str):
+            text += delta["content"]
+        if isinstance(choices[0].get("finish_reason"), str):
+            stop = choices[0]["finish_reason"]
+    if text == "" and usage is None:
+        return False, "", None, None, "bad-answer"
+    return True, text, usage, stop or "stop", None
+
+
+def _read_anthropic(raw, stream):
+    if not stream:
+        try:
+            value = json.loads(raw)
+        except json.JSONDecodeError:
+            return False, "", None, None, "bad-answer"
+        text = _text_of(value.get("content"))
+        usage = value.get("usage") or {}
+        return True, text, (usage.get("input_tokens"), usage.get("output_tokens")), value.get("stop_reason") or "end_turn", None
+    text = ""
+    usage_in = None
+    usage_out = None
+    stop = None
+    for frame in raw.split("\n\n"):
+        event = None
+        data = None
+        for line in frame.split("\n"):
+            if line.startswith("event:"):
+                event = line[6:].strip()
+            elif line.startswith("data:"):
+                data = line[5:].strip()
+        if data is None:
+            continue
+        try:
+            value = json.loads(data)
+        except json.JSONDecodeError:
+            continue
+        if not _is_record(value):
+            continue
+        if event == "message_start" and _is_record(value.get("message")):
+            inner = value["message"].get("usage") or {}
+            usage_in = inner.get("input_tokens")
+        elif event == "content_block_delta" and _is_record(value.get("delta")):
+            if value["delta"].get("type") == "text_delta" and isinstance(value["delta"].get("text"), str):
+                text += value["delta"]["text"]
+        elif event == "message_delta":
+            if _is_record(value.get("delta")) and isinstance(value["delta"].get("stop_reason"), str):
+                stop = value["delta"]["stop_reason"]
+            if _is_record(value.get("usage")):
+                usage_out = value["usage"].get("output_tokens")
+    if text == "" and usage_in is None and usage_out is None:
+        return False, "", None, None, "bad-answer"
+    return True, text, (usage_in, usage_out), stop or "end_turn", None
+
+
+def _read_gemini(raw, stream):
+    if not stream:
+        try:
+            value = json.loads(raw)
+        except json.JSONDecodeError:
+            return False, "", None, None, "bad-answer"
+        candidates = value.get("candidates") or []
+        text = ""
+        if candidates and _is_record(candidates[0]):
+            content = candidates[0].get("content") or {}
+            parts = content.get("parts") or []
+            text = "".join(part.get("text", "") for part in parts if _is_record(part) and isinstance(part.get("text"), str))
+        meta = value.get("usageMetadata") or {}
+        return True, text, (meta.get("promptTokenCount"), meta.get("candidatesTokenCount")), (candidates[0].get("finishReason") if candidates and _is_record(candidates[0]) else None) or "STOP", None
+    text = ""
+    usage = None
+    stop = None
+    for frame in raw.split("\n\n"):
+        frame = frame.strip()
+        if not frame:
+            continue
+        if frame.startswith("data:"):
+            frame = frame[5:].strip()
+        try:
+            value = json.loads(frame)
+        except json.JSONDecodeError:
+            continue
+        if not _is_record(value):
+            continue
+        candidates = value.get("candidates") or []
+        if candidates and _is_record(candidates[0]):
+            content = candidates[0].get("content") or {}
+            parts = content.get("parts") or []
+            for part in parts:
+                if _is_record(part) and isinstance(part.get("text"), str):
+                    text += part["text"]
+            if isinstance(candidates[0].get("finishReason"), str):
+                stop = candidates[0]["finishReason"]
+        meta = value.get("usageMetadata")
+        if _is_record(meta):
+            usage = (meta.get("promptTokenCount"), meta.get("candidatesTokenCount"))
+    if text == "" and usage is None:
+        return False, "", None, None, "bad-answer"
+    return True, text, usage, stop or "STOP", None
+
+
+def _render_openai(text, usage, model, stream):
+    """An OpenAI-wire answer carrying the provider's text and usage."""
+    usage_in, usage_out = usage if usage else (None, None)
+    if usage_in is None:
+        usage_in = 0
+    if usage_out is None:
+        usage_out = 0
+    tokens = {"prompt_tokens": usage_in, "completion_tokens": usage_out, "total_tokens": usage_in + usage_out}
+    if not stream:
+        return "application/json", json.dumps(
+            {
+                "id": CHAT_ID,
+                "object": "chat.completion",
+                "created": CREATED_STAMP,
+                "model": model,
+                "choices": [
+                    {"index": 0, "message": {"role": "assistant", "content": text}, "finish_reason": "stop", "logprobs": None}
+                ],
+                "usage": tokens,
+            }
+        )
+    frames = []
+    frames.append("data: " + json.dumps({"id": CHAT_ID, "object": "chat.completion.chunk", "created": CREATED_STAMP, "model": model, "choices": [{"index": 0, "delta": {"role": "assistant", "content": ""}, "finish_reason": None}]}) + "\n\n")
+    at = 0
+    while at < len(text):
+        piece = text[at : at + 32]
+        frames.append("data: " + json.dumps({"id": CHAT_ID, "object": "chat.completion.chunk", "created": CREATED_STAMP, "model": model, "choices": [{"index": 0, "delta": {"content": piece}, "finish_reason": None}]}) + "\n\n")
+        at += 32
+    frames.append("data: " + json.dumps({"id": CHAT_ID, "object": "chat.completion.chunk", "created": CREATED_STAMP, "model": model, "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}) + "\n\n")
+    frames.append("data: " + json.dumps({"id": CHAT_ID, "object": "chat.completion.chunk", "created": CREATED_STAMP, "model": model, "choices": [], "usage": tokens}) + "\n\n")
+    frames.append("data: [DONE]\n\n")
+    return "text/event-stream; charset=utf-8", "".join(frames)
+
+
+def _render_anthropic(text, usage, model, stream):
+    """An Anthropic-wire answer carrying the provider's text and usage."""
+    usage_in, usage_out = usage if usage else (None, None)
+    if usage_in is None:
+        usage_in = 0
+    if usage_out is None:
+        usage_out = 0
+    if not stream:
+        return "application/json", json.dumps(
+            {
+                "id": MESSAGE_ID,
+                "type": "message",
+                "role": "assistant",
+                "model": model,
+                "content": [{"type": "text", "text": text}],
+                "stop_reason": "end_turn",
+                "stop_sequence": None,
+                "usage": {"input_tokens": usage_in, "output_tokens": usage_out},
+            }
+        )
+    frames = []
+    frames.append(
+        "event: message_start\ndata: "
+        + json.dumps({"type": "message_start", "message": {"id": MESSAGE_ID, "type": "message", "role": "assistant", "model": model, "content": [], "stop_reason": None, "stop_sequence": None, "usage": {"input_tokens": usage_in, "output_tokens": 0}}})
+        + "\n\n"
+    )
+    frames.append(
+        "event: content_block_start\ndata: " + json.dumps({"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}}) + "\n\n"
+    )
+    at = 0
+    while at < len(text):
+        piece = text[at : at + 32]
+        frames.append(
+            "event: content_block_delta\ndata: " + json.dumps({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": piece}}) + "\n\n"
+        )
+        at += 32
+    frames.append("event: content_block_stop\ndata: " + json.dumps({"type": "content_block_stop", "index": 0}) + "\n\n")
+    frames.append(
+        "event: message_delta\ndata: "
+        + json.dumps({"type": "message_delta", "delta": {"stop_reason": "end_turn", "stop_sequence": None}, "usage": {"output_tokens": usage_out}})
+        + "\n\n"
+    )
+    frames.append("event: message_stop\ndata: " + json.dumps({"type": "message_stop"}) + "\n\n")
+    return "text/event-stream; charset=utf-8", "".join(frames)
+
+
+class Aggregator:
+    """Holds the brief, the catalog, the router, and the request counter."""
+
+    def __init__(self, env_url, brief):
+        self.env_url = (env_url or "").rstrip("/")
+        self.brief = brief
+        self.directory = brief.directory()
+        self.catalog = Catalog(brief)
+        self.router = Router(brief.rows, brief.manifest)
+        self.counter = 0
+        self.counter_lock = threading.Lock()
+        for provider, info in self.directory.items():
+            _WIRE_OF[provider] = info.get("wire")
+        self._merge_instance()
+
+    def _merge_instance(self):
+        """Prefer the env's own directory for dialing, when it answers."""
+        if not self.env_url:
+            return
+        try:
+            request = urllib.request.Request(self.env_url + "/instance", method="GET")
+            with urllib.request.urlopen(request, timeout=PROVIDER_TIMEOUT_SECONDS) as response:
+                instance = json.loads(response.read().decode("utf-8"))
+        except Exception as err:
+            sys.stderr.write("aggregator: /instance unreachable (%s); dialing from the brief\n" % err.__class__.__name__)
+            return
+        providers = instance.get("providers") or []
+        for entry in providers:
+            if not _is_record(entry) or not isinstance(entry.get("id"), str):
+                continue
+            info = self.directory.setdefault(entry["id"], {})
+            for key in ("wire", "auth", "key_env", "key"):
+                if entry.get(key) is not None:
+                    info[key] = entry[key]
+            base_url = entry.get("base_url")
+            if isinstance(base_url, str) and base_url:
+                info["path"] = urllib.parse.urlparse(base_url).path or info.get("path")
+                info["base_url"] = base_url
+        if isinstance(instance.get("workload"), dict):
+            manifest = instance["workload"].get("manifest")
+            if isinstance(manifest, list) and manifest:
+                self.router.manifest = manifest
+                self.brief.manifest = manifest
+
+    def catalog_document(self):
+        return self.catalog.document(self.directory)
+
+    def catalog_bytes(self):
+        return json.dumps(self.catalog_document(), separators=(",", ":")).encode("utf-8")
+
+    def models_answer(self, anthropic_shape):
+        ids = self.catalog.free_ids()
+        if anthropic_shape:
+            data = [{"type": "model", "id": model_id, "display_name": model_id, "created_at": "2026-01-01T00:00:00Z", "free": True} for model_id in ids]
+            return "application/json", json.dumps({"data": data, "has_more": False})
+        data = [{"id": model_id, "object": "model", "created": CREATED_STAMP, "owned_by": "aggregator", "free": True} for model_id in ids]
+        return "application/json", json.dumps({"object": "list", "data": data})
+
+    def serve(self, client_api, client):
+        """Answer one client request; returns (status, content_type, body)."""
+        with self.counter_lock:
+            index = self.counter
+            self.counter += 1
+        manifest = self.router.manifest
+        item = manifest[index] if 0 <= index < len(manifest) else None
+        request_id = item.get("id") if item else "r?"
+        stream = client.get("stream") is True
+        requires = (item.get("requires") or {}) if item else {}
+        wants_json = False
+        if client_api == "openai":
+            fmt = client.get("response_format")
+            wants_json = _is_record(fmt) and fmt.get("type") in ("json_object", "json_schema")
+        tries = self.router.candidates(request_id, index, wants_json)
+        if not tries and not item:
+            tries = self._fallback_candidates(client_api, requires, wants_json)
+        for row in tries:
+            provider = row.get("provider")
+            info = self.directory.get(provider) or {}
+            if not info.get("path"):
+                info = dict(info)
+                info["path"] = "/p/" + provider
+            self.router.note_call(provider)
+            ok, text, usage, _stop, cause = _call_provider(self.env_url, info, row, client, stream, wants_json)
+            if ok:
+                sys.stderr.write("aggregator: %s served by %s/%s\n" % (request_id, provider, row.get("model")))
+                if client_api == "openai":
+                    content_type, body = _render_openai(text, usage, row.get("model"), stream)
+                else:
+                    content_type, body = _render_anthropic(text, usage, row.get("model"), stream)
+                return 200, content_type, body
+            sys.stderr.write("aggregator: %s refused by %s (%s)\n" % (request_id, provider, cause))
+            if cause in ("spent", "outage"):
+                self.router.note_spent(provider)
+        sys.stderr.write("aggregator: %s unserved after %d tries\n" % (request_id, len(tries)))
+        return 502, "application/json", json.dumps({"error": {"message": "no provider could serve this request", "type": "api_error", "code": "no_provider"}})
+
+    def _fallback_candidates(self, client_api, requires, wants_json):
+        """Eligibility straight from the body when the manifest runs out."""
+        rows = []
+        for row in self.router.rows:
+            if not _row_meets(row, requires):
+                continue
+            if wants_json and client_api == "openai" and _WIRE_OF.get(row.get("provider")) == "anthropic":
+                continue
+            rows.append(row)
+        rows.sort(key=lambda row: (-row.get("rating_milli", 0), row.get("provider") or "", row.get("model") or ""))
+        return rows
+
+
+def _handler_factory(aggregator):
+    class Handler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def log_message(self, *args):
+            pass
+
+        def _read_json(self):
+            length = self.headers.get("Content-Length")
+            try:
+                size = int(length) if length else 0
+            except ValueError:
+                size = 0
+            raw = self.rfile.read(size) if size > 0 else b""
+            if not raw:
+                return {}
+            try:
+                value = json.loads(raw.decode("utf-8"))
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                return {}
+            return value if _is_record(value) else {}
+
+        def _send(self, status, content_type, body):
+            data = body.encode("utf-8") if isinstance(body, str) else body
+            self.send_response(status)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def do_GET(self):
+            if urllib.parse.urlparse(self.path).path == "/v1/models":
+                anthropic_shape = self.headers.get("x-api-key") is not None
+                content_type, body = aggregator.models_answer(anthropic_shape)
+                self._send(200, content_type, body)
+                return
+            self._send(404, "application/json", json.dumps({"error": {"message": "not found", "type": "invalid_request_error"}}))
+
+        def do_POST(self):
+            path = urllib.parse.urlparse(self.path).path
+            if path == "/v1/chat/completions":
+                status, content_type, body = aggregator.serve("openai", self._read_json())
+                self._send(status, content_type, body)
+                return
+            if path == "/v1/messages":
+                status, content_type, body = aggregator.serve("anthropic", self._read_json())
+                self._send(status, content_type, body)
+                return
+            self._send(404, "application/json", json.dumps({"error": {"message": "not found", "type": "invalid_request_error"}}))
+
+    return Handler
+
+
+def _register(env_url, port, catalog):
+    body = json.dumps({"protocol_version": 1, "port": port, "catalog": catalog}, separators=(",", ":")).encode("utf-8")
+    request = urllib.request.Request(
+        env_url.rstrip("/") + "/register", data=body, headers={"Content-Type": "application/json"}, method="POST"
+    )
+    with urllib.request.urlopen(request, timeout=PROVIDER_TIMEOUT_SECONDS) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+def _work_done(env_url):
+    try:
+        request = urllib.request.Request(env_url.rstrip("/") + "/work", method="GET")
+        with urllib.request.urlopen(request, timeout=PROVIDER_TIMEOUT_SECONDS) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except Exception:
+        return {}
+
+
+def main(argv):
+    prompt_file = os.environ.get("MAKEFUN_PROMPT_FILE") or ""
+    env_url = os.environ.get("MAKEFUN_ENV_URL") or ""
+    brief = Brief(prompt_file)
+    if "--list" in argv:
+        if not prompt_file:
+            sys.stdout.write('{"providers":[]}\n')
+            return 0
+        aggregator = Aggregator("", brief)
+        sys.stdout.write(aggregator.catalog_bytes().decode("utf-8") + "\n")
+        return 0
+    if not env_url:
+        sys.stderr.write("aggregator: MAKEFUN_ENV_URL is not set\n")
         return 1
-    STATE.env_url = env_url.rstrip("/")
-    STATE.providers = providers
-    STATE.by_id = {provider["id"]: provider for provider in providers}
-    STATE.ratings = ratings
-    STATE.manifest = manifest
-    STATE.by_request = {item["id"]: item for item in manifest}
-    STATE.catalog = assemble_catalog(STATE.env_url, providers, ratings)
-    server = AggregatorServer(("0.0.0.0", 0), AggregatorHandler)
+    aggregator = Aggregator(env_url, brief)
+    server = ThreadingHTTPServer(("0.0.0.0", 0), _handler_factory(aggregator))
     port = server.server_address[1]
-    threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True).start()
-    if not register(STATE.env_url, port, STATE.catalog):
-        sys.stderr.write("main.py: register failed\n")
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    catalog = aggregator.catalog_document()
+    answer = None
+    for attempt in range(REGISTER_RETRIES):
+        try:
+            answer = _register(env_url, port, catalog)
+            break
+        except Exception as err:
+            sys.stderr.write("aggregator: register attempt %d failed (%s)\n" % (attempt + 1, err.__class__.__name__))
+            time.sleep(0.5)
+    if not _is_record(answer) or answer.get("ok") is not True:
+        sys.stderr.write("aggregator: registration failed\n")
         server.shutdown()
         return 1
+    sys.stderr.write("aggregator: registered on port %d for %s requests\n" % (port, answer.get("requests")))
     while True:
-        work = lookup_work()
-        if work is not None and work.get("done") is True:
+        state = _work_done(env_url)
+        if state.get("done") is True:
             break
-        time.sleep(POLL_GAP)
+        time.sleep(WORK_POLL_SECONDS)
+    sys.stderr.write("aggregator: workload done, exiting\n")
     server.shutdown()
-    server.server_close()
     return 0
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    raise SystemExit(main(sys.argv[1:]))
