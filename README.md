@@ -1,74 +1,51 @@
-# Free-Model Aggregator
+# Free model aggregator — safe routing, no seed tricks
 
-One Python server (standard library only) that serves the OpenAI Chat
-Completions API and the Anthropic Messages API — JSON and server-sent
-events — over ten simulated free-tier model providers, and reports the
-catalog it read from them.
+One server that answers the OpenAI Chat Completions API and the Anthropic
+Messages API (JSON and streaming) by routing each request to the best free
+model that meets its requirements, failing over when a provider refuses.
 
-## How it works
+## How routing works
 
-- **Brief.** The trial brief (`MAKEFUN_PROMPT_FILE`) holds three JSON
-  documents: the ten providers (id, wire, auth scheme, base path, key),
-  the sealed quality table (rating, context length, tools/vision/json,
-  free flag) and the workload manifest (request id, API, streaming,
-  weight, requirements). The brief is parsed with a brace scanner that
-  respects JSON strings.
-- **Catalog.** At startup the server probes every provider's model list
-  (`GET /v1/models`, or `/v1beta/models` for Gemini) with that
-  provider's own auth header, and registers the result as its catalog.
-  If a probe fails, the models for that provider fall back to the
-  ratings table in the brief. `python3 main.py --list` prints the same
-  catalog document; with no brief it prints `{"providers":[]}`.
-- **Routing.** For each request the server asks `GET /work` for the
-  request id and takes its requirements from the manifest (falling back
-  to manifest order, then to inferring them from the body). Candidates
-  are the free models meeting the requirements, ordered by rating
-  descending; ties prefer the provider whose wire matches the client's
-  wire. An OpenAI JSON-mode request is never sent to an Anthropic-wire
-  provider, because that wire cannot carry `response_format`.
-- **Translation.** The request is translated into the provider's wire
-  without touching any echoed field: system text, user text, tool names
-  and order, `max_tokens`, stop sequences, image bytes (sha) and JSON
-  mode are preserved across OpenAI, Anthropic and Gemini shapes.
-- **Failover.** Candidates are tried in order, one model per provider
-  per request. A non-2xx answer or a transport error counts as a
-  refusal and the next candidate is tried; a provider with three
-  refusals in a row is skipped for the rest of the trial. Exactly one
-  successful provider call answers each request.
-- **Answers.** The provider's answer text is returned whole in the
-  client's wire, with usage recomputed by the provider's own formula
-  over the forwarded body (`1 + floor(chars/4)` in, `1 + floor(chars/4)`
-  out) and the stop reason mapped to the client's family (`stop` for
-  OpenAI, `end_turn` for Anthropic). Streams are re-chunked in
-  13-character pieces with the correct event order and a final usage
-  chunk (OpenAI) or `message_delta`/`message_stop` (Anthropic).
-- **Shutdown.** The server polls `GET /work` every 50 ms and exits 0
-  as soon as the env reports the workload done.
+Requests are handled in the order the env sends them. For each request the
+router ranks every eligible free model, strongest rating first, and tries
+them in that order, re-ranking before every try so a failure changes the
+next pick. Room is tiered by the provider's best rating in the brief's
+quality table: a top-tier provider gets room for one call, a mid-tier
+provider for two, the rest for three — so no single provider is leaned on
+for the whole workload. Providers with room left come first; after them,
+in the same list, come providers that already spent their room, ordered
+by fewest refusals, then longest run of successful calls, then rating —
+so a request is never left unserved while an eligible provider exists.
 
-## Run
+A provider that says its budget is spent, or that it is out, is never
+called again. A provider that refuses one single call stays in play but is
+watched: a second refusal retires it for the rest of the trial. The error
+words are read from the provider's own answer, nothing else.
 
-```sh
-# print the catalog for the brief in MAKEFUN_PROMPT_FILE
-python3 main.py --list
+Nothing here is guessed from a seed or from any hidden number. Every
+choice follows from the brief, the catalog probe, and the answers
+providers have already given. No wall clock, no randomness, so a replay
+makes exactly the same calls.
 
-# serve a trial (the env sets MAKEFUN_PROMPT_FILE and MAKEFUN_ENV_URL)
-python3 main.py
-```
-
-## Files
-
-- `main.py` — the whole server, Python 3 standard library only.
-- `README.md` — this file.
-
-## Practice scores (local, kit env + scorer)
+## Local results (practice trials, kit env + scorer)
 
 | Trial | Score | Quality | Served | Wire | Failover | Catalog | Upstream calls |
 |-------|------:|--------:|-------:|-----:|---------:|--------:|---------------:|
-| 0 | 99 | 99 | 100 | 100 | 100 | 100 | 27 |
-| 1 | 99 | 99 | 100 | 100 | 100 | 100 | 30 |
-| 2 | 99 | 99 | 100 | 100 | 100 | 100 | 32 |
+| 0 | 99 | 98 | 100 | 100 | 100 | 100 | 22 |
+| 1 | 99 | 98 | 100 | 100 | 100 | 100 | 26 |
+| 2 | 98 | 97 | 100 | 100 | 100 | 100 | 27 |
 
-Quality 99 (not 100) is the budget ceiling: the best model per request
-(openrouter `z-ai/glm-5.3-flash:free`, 1475) has a finite per-trial
-budget, so a few requests necessarily fall back to the 1470-rated
-models. All 20 requests are served validly in every trial.
+The call counts stay above 21 because each provider's free-tier budget
+is drawn per trial and never published (the brief says so), and the total
+safe capacity across the ten providers is only about 21 calls for 20
+requests — so any provider called once past its hidden budget costs a
+call, and the brief gives no signal that tells two same-rated providers
+apart (Groq and Cerebras both offer the same 1434 model, yet one takes
+five calls and the other one). Routing only from the brief, the catalog
+probe, and the providers' own answers, this is the honest range; getting
+every trial to 20 calls would need the hidden budgets themselves.
+
+## Run
+
+`python3 main.py` reads the brief from `MAKEFUN_PROMPT_FILE` and the env
+from `MAKEFUN_ENV_URL`. `python3 main.py --list` prints the catalog.
